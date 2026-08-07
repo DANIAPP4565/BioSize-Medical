@@ -1,0 +1,19 @@
+BioSize Clinical v1.3.1 — Validación técnica
+
+Fecha: 2026-08-06
+
+Pruebas realizadas:
+- Compilación Python completa: correcta.
+- Lectura de protocolos JSON, YAML, DOCX y PDF: correcta.
+- Detección de outcome y vinculación con dataset: correcta.
+- Mapa de roles y recuento de parámetros: correcto.
+- Comparaciones de variables continuas, binarias y categóricas: correctas.
+- Regresión logística univariable y multivariable: ejecutadas.
+- Detección de estimaciones inestables por separación/categorías escasas: incorporada.
+- VIF para colinealidad: ejecutado.
+- Ridge con validación cruzada, AUC, Brier, ROC y calibración: ejecutado.
+- Generación de informe Word y Excel: correcta.
+- Los 17 diseños de tamaño de muestra completaron casos de prueba representativos.
+
+Limitación del entorno de validación:
+- No fue posible instalar Streamlit desde el índice de paquetes disponible en este contenedor; la lógica estadística, importadores y reportes se probaron directamente.
