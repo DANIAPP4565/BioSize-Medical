@@ -1,0 +1,32 @@
+{
+  "tipo_diseno": "medias_independientes",
+  "error_alfa": 0.05,
+  "poder_estadistico": 0.8,
+  "efecto_esperado": 5.0,
+  "variabilidad_estimada": 10.0,
+  "perdidas_esperadas": 0.1,
+  "outcomes": [
+    {
+      "nombre": "Presión arterial sistólica a las 12 semanas",
+      "rol": "primario",
+      "tipo": "continuo",
+      "unidad": "mmHg",
+      "momento": "12 semanas",
+      "columna": "PAS_12semanas",
+      "tipo_diseno": "medias_independientes",
+      "efecto_esperado": 5.0,
+      "variabilidad_estimada": 10.0
+    },
+    {
+      "nombre": "Presión arterial diastólica a las 12 semanas",
+      "rol": "coprimario",
+      "tipo": "continuo",
+      "unidad": "mmHg",
+      "momento": "12 semanas",
+      "columna": "PAD_12semanas",
+      "tipo_diseno": "medias_independientes",
+      "efecto_esperado": 3.0,
+      "variabilidad_estimada": 10.0
+    }
+  ]
+}

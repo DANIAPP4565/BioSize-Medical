@@ -1,0 +1,14 @@
+tipo_diseno: medias_independientes
+error_alfa: 0.05
+poder_estadistico: 0.8
+efecto_esperado: 5.0
+variabilidad_estimada: 10.0
+perdidas_esperadas: 0.1
+outcome_primario: Presión arterial sistólica a las 12 semanas
+definicion_outcome: Cambio de la presión arterial sistólica desde el valor basal hasta
+  la semana 12
+tipo_outcome: continuo
+unidad_outcome: mmHg
+momento_evaluacion: 12 semanas
+columna_dataset_outcome: PAS_12semanas
+outcome_secundarios: Presión arterial diastólica y proporción de pacientes controlados
