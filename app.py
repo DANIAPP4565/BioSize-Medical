@@ -5,12 +5,9 @@ import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import tempfile
 import unicodedata
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from datetime import datetime
 from typing import Any, Callable
 
@@ -22,7 +19,6 @@ import yaml
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
-from pypdf import PdfReader
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
@@ -34,39 +30,8 @@ from sqlalchemy import create_engine, inspect
 
 
 APP_NAME = "BioSize Clinical"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.0.0"
 MIN_POWER = 0.80
-
-OUTCOME_TYPE_LABELS: dict[str, str] = {
-    "continuous": "Continuo",
-    "binary": "Dicotómico/binario",
-    "paired_binary": "Dicotómico apareado",
-    "time_to_event": "Tiempo hasta evento",
-    "diagnostic": "Precisión diagnóstica",
-    "ordinal": "Ordinal",
-    "count": "Conteo/tasa",
-    "unknown": "No especificado",
-}
-
-DESIGN_OUTCOME_TYPES: dict[str, set[str]] = {
-    "mean_estimation": {"continuous"},
-    "proportion_estimation": {"binary", "ordinal", "count"},
-    "means_independent": {"continuous"},
-    "means_paired": {"continuous"},
-    "proportions_independent": {"binary"},
-    "mcnemar": {"paired_binary", "binary"},
-    "superiority_continuous": {"continuous"},
-    "superiority_binary": {"binary"},
-    "noninferiority_continuous": {"continuous"},
-    "noninferiority_binary": {"binary"},
-    "equivalence_continuous": {"continuous"},
-    "equivalence_binary": {"binary"},
-    "odds_ratio": {"binary"},
-    "risk_ratio": {"binary"},
-    "diagnostic_accuracy": {"diagnostic", "binary"},
-    "survival": {"time_to_event"},
-}
-
 
 
 # -----------------------------------------------------------------------------
@@ -614,1047 +579,26 @@ def calculate_sample_size(params: dict[str, Any], power_override: float | None =
     raise ValueError("Diseño no implementado.")
 
 
-
-def _entry_number(entry: dict[str, Any], keys: tuple[str, ...], default: float | None = None) -> float | None:
-    for key in keys:
-        if entry.get(key) not in (None, ""):
-            return _parse_locale_number(entry[key])
-    return default
-
-
-def _as_probability(value: float, name: str) -> float:
-    numeric = float(value)
-    if 1 < numeric <= 100:
-        numeric /= 100
-    return clamp_probability(numeric, name)
-
-
-def build_params_for_structured_outcome(
-    entry: dict[str, Any],
-    base_params: dict[str, Any],
-) -> dict[str, Any]:
-    outcome_type = infer_outcome_type(entry.get("tipo_outcome", ""))
-    design_value = entry.get("tipo_diseno")
-    if design_value:
-        code = resolve_design(design_value)
-    else:
-        code = suggested_design_for_outcome(outcome_type, base_params.get("design_code")) or base_params["design_code"]
-
-    alpha = _entry_number(entry, ("error_alfa",), float(base_params.get("alpha", 0.05)))
-    power = _entry_number(entry, ("poder_estadistico",), float(base_params.get("power", 0.80)))
-    loss = _entry_number(entry, ("perdidas_esperadas",), float(base_params.get("loss_rate", 0.0)))
-    assert alpha is not None and power is not None and loss is not None
-    if alpha > 1:
-        alpha /= 100
-    if power > 1:
-        power /= 100
-    if loss > 1:
-        loss /= 100
-
-    params: dict[str, Any] = {
-        "design_code": code,
-        "alpha": alpha,
-        "power": power,
-        "sided": entry.get("sided", base_params.get("sided", "Bilateral")),
-        "loss_rate": loss,
-        "outcome": {
-            "outcome_primario": entry.get("outcome_primario", ""),
-            "definicion_outcome": entry.get("definicion_outcome", ""),
-            "tipo_outcome": outcome_type,
-            "tipo_outcome_label": OUTCOME_TYPE_LABELS.get(outcome_type, outcome_type),
-            "unidad_outcome": entry.get("unidad_outcome", ""),
-            "momento_evaluacion": entry.get("momento_evaluacion", ""),
-            "columna_dataset_outcome": entry.get("columna_dataset_outcome", ""),
-            "valor_evento": entry.get("valor_evento", ""),
-            "confirmado": True,
-        },
-    }
-    effect = _entry_number(entry, ("efecto_esperado", "delta", "margen"))
-    variability = _entry_number(entry, ("variabilidad_estimada", "sd", "desviacion_estandar"))
-
-    if code == "mean_estimation":
-        params["sd"] = positive(variability if variability is not None else 0, "Variabilidad estimada")
-        params["precision"] = positive(
-            _entry_number(entry, ("precision",), effect) or 0,
-            "Precisión",
-        )
-        params["finite_population"] = bool(entry.get("finite_population", False))
-        if params["finite_population"]:
-            params["population"] = int(_entry_number(entry, ("poblacion",), 0) or 0)
-    elif code == "proportion_estimation":
-        proportion = _entry_number(entry, ("proporcion_esperada", "p"), effect)
-        precision = _entry_number(entry, ("precision",), variability)
-        params["p"] = _as_probability(proportion or 0, "Proporción esperada")
-        params["precision"] = positive(precision or 0, "Precisión")
-        if params["precision"] > 1:
-            params["precision"] /= 100
-        params["finite_population"] = bool(entry.get("finite_population", False))
-        if params["finite_population"]:
-            params["population"] = int(_entry_number(entry, ("poblacion",), 0) or 0)
-    elif code in {"means_independent", "superiority_continuous"}:
-        params["delta"] = positive(effect or 0, "Efecto esperado")
-        params["sd"] = positive(variability or 0, "Variabilidad estimada")
-    elif code == "means_paired":
-        params["delta"] = positive(effect or 0, "Efecto esperado")
-        params["sd_diff"] = positive(variability or 0, "Variabilidad de las diferencias")
-    elif code in {"proportions_independent", "superiority_binary"}:
-        p2 = _entry_number(entry, ("proporcion_grupo_2", "proporcion_control", "p2"), variability)
-        p1 = _entry_number(entry, ("proporcion_grupo_1", "p1"))
-        p2_prob = _as_probability(p2 or 0, "Proporción control")
-        if p1 is None:
-            diff = float(effect or 0)
-            if abs(diff) > 1:
-                diff /= 100
-            p1 = p2_prob + diff
-        params["p1"] = _as_probability(p1, "Proporción grupo 1")
-        params["p2"] = p2_prob
-        params["yates"] = bool(entry.get("yates", base_params.get("yates", False)))
-    elif code == "mcnemar":
-        p01 = _entry_number(entry, ("p01",))
-        p10 = _entry_number(entry, ("p10",))
-        if p01 is None or p10 is None:
-            discordance = float(variability or 0)
-            difference = float(effect or 0)
-            if discordance > 1:
-                discordance /= 100
-            if difference > 1:
-                difference /= 100
-            p01 = (discordance + difference) / 2
-            p10 = (discordance - difference) / 2
-        params["p01"] = _as_probability(p01, "p01")
-        params["p10"] = _as_probability(p10, "p10")
-        params["yates"] = bool(entry.get("yates", base_params.get("yates", False)))
-    elif code in {"noninferiority_continuous", "equivalence_continuous"}:
-        params["sd"] = positive(variability or 0, "Variabilidad estimada")
-        params["margin"] = positive(_entry_number(entry, ("margen",), effect) or 0, "Margen")
-        params["expected_diff"] = float(_entry_number(entry, ("expected_diff", "diferencia_esperada"), 0.0) or 0.0)
-        params["sided"] = "Unilateral"
-    elif code in {"noninferiority_binary", "equivalence_binary"}:
-        baseline = _entry_number(entry, ("proporcion_grupo_2", "proporcion_control", "p2"), variability)
-        p2_prob = _as_probability(baseline or 0, "Proporción control")
-        p1_value = _entry_number(entry, ("proporcion_grupo_1", "p1"), p2_prob)
-        margin = _entry_number(entry, ("margen",), effect)
-        params["p1"] = _as_probability(p1_value or 0, "Proporción tratamiento")
-        params["p2"] = p2_prob
-        params["margin"] = positive(margin or 0, "Margen")
-        if params["margin"] > 1:
-            params["margin"] /= 100
-        params["yates"] = bool(entry.get("yates", base_params.get("yates", False)))
-        params["sided"] = "Unilateral"
-    elif code in {"odds_ratio", "risk_ratio"}:
-        baseline = _entry_number(entry, ("proporcion_control", "p_control"), variability)
-        ratio_key = "odds_ratio" if code == "odds_ratio" else "riesgo_relativo"
-        ratio = _entry_number(entry, (ratio_key, "effect_ratio"), effect)
-        params["p_control"] = _as_probability(baseline or 0, "Riesgo basal")
-        params["effect_ratio"] = positive(ratio or 0, "Medida de asociación")
-        params["yates"] = bool(entry.get("yates", base_params.get("yates", False)))
-    elif code == "diagnostic_accuracy":
-        prevalence = _entry_number(entry, ("prevalencia",), variability)
-        sensitivity = _entry_number(entry, ("sensibilidad",), effect)
-        specificity = _entry_number(entry, ("especificidad",), effect)
-        params["prevalence"] = _as_probability(prevalence or 0, "Prevalencia")
-        params["sensitivity"] = _as_probability(sensitivity or 0, "Sensibilidad")
-        params["specificity"] = _as_probability(specificity or 0, "Especificidad")
-        params["precision_se"] = _entry_number(entry, ("precision_sensibilidad",), base_params.get("precision_se", 0.05))
-        params["precision_sp"] = _entry_number(entry, ("precision_especificidad",), base_params.get("precision_sp", 0.05))
-        if params["precision_se"] > 1:
-            params["precision_se"] /= 100
-        if params["precision_sp"] > 1:
-            params["precision_sp"] /= 100
-    elif code == "survival":
-        hr = _entry_number(entry, ("hazard_ratio",), effect)
-        mortality_control = _entry_number(entry, ("mortalidad_control",), variability)
-        params["hazard_ratio"] = positive(hr or 0, "Hazard ratio")
-        params["mortality_control"] = _as_probability(mortality_control or 0, "Mortalidad control")
-        treatment = _entry_number(entry, ("mortalidad_tratamiento",))
-        if treatment is None:
-            treatment = min(max(params["mortality_control"] * params["hazard_ratio"], 0.001), 0.999)
-        params["mortality_treatment"] = _as_probability(treatment, "Mortalidad tratamiento")
-        params["allocation_treatment"] = float(
-            _entry_number(entry, ("allocation_treatment", "asignacion_tratamiento"), base_params.get("allocation_treatment", 0.50))
-            or 0.50
-        )
-    else:
-        raise ValueError(f"No se pudo construir el escenario para {code}.")
-
-    return params
-
-
-def calculate_structured_outcome_scenarios(
-    outcomes: list[dict[str, Any]],
-    base_params: dict[str, Any],
-) -> tuple[pd.DataFrame, list[str]]:
-    rows: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    for entry in outcomes:
-        if not (entry.get("es_primario") or entry.get("es_coprimario")):
-            continue
-        name = str(entry.get("outcome_primario", "Outcome sin nombre"))
-        try:
-            scenario_params = build_params_for_structured_outcome(entry, base_params)
-            scenario_result = calculate_sample_size(scenario_params)
-            rows.append(
-                {
-                    "Outcome": name,
-                    "Rol": "Coprimario" if entry.get("es_coprimario") else "Primario",
-                    "Tipo": scenario_params["outcome"].get("tipo_outcome_label", ""),
-                    "Diseño": DESIGNS[scenario_params["design_code"]],
-                    "N total": scenario_result.n_final_total,
-                    "Estado": "Calculado",
-                }
-            )
-        except Exception as exc:
-            warnings.append(f"{name}: {exc}")
-            rows.append(
-                {
-                    "Outcome": name,
-                    "Rol": "Coprimario" if entry.get("es_coprimario") else "Primario",
-                    "Tipo": OUTCOME_TYPE_LABELS.get(infer_outcome_type(entry.get("tipo_outcome", "")), "No especificado"),
-                    "Diseño": str(entry.get("tipo_diseno", "No especificado")),
-                    "N total": "—",
-                    "Estado": "Parámetros insuficientes",
-                }
-            )
-    return pd.DataFrame(rows), warnings
-
-
 # -----------------------------------------------------------------------------
 # Importación de datos y protocolos
 # -----------------------------------------------------------------------------
-PROTOCOL_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
-    "tipo_diseno": (
-        "tipo de diseño",
-        "tipo de diseno",
-        "diseño del estudio",
-        "diseno del estudio",
-        "diseño estadístico",
-        "diseno estadistico",
-        "diseño metodológico",
-        "diseno metodologico",
-    ),
-    "error_alfa": (
-        "error alfa",
-        "nivel alfa",
-        "nivel de significación",
-        "nivel de significacion",
-        "significancia alfa",
-        "alpha",
-        "alfa",
-    ),
-    "poder_estadistico": (
-        "poder estadístico",
-        "poder estadistico",
-        "potencia estadística",
-        "potencia estadistica",
-        "potencia del estudio",
-        "poder del estudio",
-        "1-beta",
-        "1 - beta",
-    ),
-    "efecto_esperado": (
-        "efecto esperado",
-        "tamaño del efecto",
-        "tamano del efecto",
-        "diferencia mínima clínicamente importante",
-        "diferencia minima clinicamente importante",
-        "diferencia clínicamente importante",
-        "diferencia clinicamente importante",
-        "diferencia esperada",
-        "dmci",
-        "delta esperado",
-    ),
-    "variabilidad_estimada": (
-        "variabilidad estimada",
-        "desviación estándar estimada",
-        "desviacion estandar estimada",
-        "desvío estándar estimado",
-        "desvio estandar estimado",
-        "desviación estándar",
-        "desviacion estandar",
-        "desvío estándar",
-        "desvio estandar",
-        "sigma estimada",
-        "sigma",
-    ),
-    "perdidas_esperadas": (
-        "pérdidas esperadas",
-        "perdidas esperadas",
-        "pérdidas de seguimiento",
-        "perdidas de seguimiento",
-        "tasa de pérdidas",
-        "tasa de perdidas",
-        "abandono esperado",
-    ),
-    "precision": (
-        "precisión absoluta",
-        "precision absoluta",
-        "error máximo aceptable",
-        "error maximo aceptable",
-        "precisión esperada",
-        "precision esperada",
-    ),
-    "margen": (
-        "margen de no inferioridad",
-        "margen de equivalencia",
-        "margen clínico",
-        "margen clinico",
-        "margen absoluto",
-    ),
-    "proporcion_grupo_1": (
-        "proporción grupo 1",
-        "proporcion grupo 1",
-        "proporción tratamiento",
-        "proporcion tratamiento",
-        "tasa tratamiento",
-    ),
-    "proporcion_grupo_2": (
-        "proporción grupo 2",
-        "proporcion grupo 2",
-        "proporción control",
-        "proporcion control",
-        "tasa control",
-    ),
-    "proporcion_esperada": ("proporción esperada", "proporcion esperada"),
-    "proporcion_control": (
-        "riesgo basal en control",
-        "proporción basal en control",
-        "proporcion basal en control",
-        "proporción de expuestos en controles",
-        "proporcion de expuestos en controles",
-    ),
-    "prevalencia": ("prevalencia", "prevalencia de la enfermedad"),
-    "sensibilidad": ("sensibilidad esperada", "sensibilidad"),
-    "especificidad": ("especificidad esperada", "especificidad"),
-    "precision_sensibilidad": (
-        "precisión para sensibilidad",
-        "precision para sensibilidad",
-        "error de sensibilidad",
-    ),
-    "precision_especificidad": (
-        "precisión para especificidad",
-        "precision para especificidad",
-        "error de especificidad",
-    ),
-    "odds_ratio": ("odds ratio", "razón de momios", "razon de momios"),
-    "riesgo_relativo": ("riesgo relativo", "relative risk"),
-    "hazard_ratio": ("hazard ratio", "razón de riesgos", "razon de riesgos"),
-    "mortalidad_control": (
-        "mortalidad acumulada control",
-        "mortalidad en control",
-        "tasa de mortalidad control",
-    ),
-    "mortalidad_tratamiento": (
-        "mortalidad acumulada tratamiento",
-        "mortalidad en tratamiento",
-        "tasa de mortalidad tratamiento",
-    ),
-    "poblacion": ("tamaño de la población", "tamano de la poblacion", "población finita", "poblacion finita"),
-    "p01": ("discordantes 0 a 1", "discordantes 0→1", "p01"),
-    "p10": ("discordantes 1 a 0", "discordantes 1→0", "p10"),
-    "outcome_primario": (
-        "desenlace primario",
-        "desenlace principal",
-        "variable de resultado primaria",
-        "variable de resultado principal",
-        "variable primaria",
-        "variable principal",
-        "outcome primario",
-        "primary outcome",
-        "endpoint primario",
-        "primary endpoint",
-        "criterio principal de valoración",
-        "criterio principal de valoracion",
-        "resultado primario",
-    ),
-    "definicion_outcome": (
-        "definición del desenlace",
-        "definicion del desenlace",
-        "definición del outcome",
-        "definicion del outcome",
-        "definición operacional",
-        "definicion operacional",
-        "definición de la variable primaria",
-        "definicion de la variable primaria",
-    ),
-    "tipo_outcome": (
-        "tipo de outcome",
-        "tipo de desenlace",
-        "naturaleza del desenlace",
-        "escala del desenlace",
-        "tipo de variable primaria",
-    ),
-    "unidad_outcome": (
-        "unidad del outcome",
-        "unidad del desenlace",
-        "unidad de medida",
-        "unidades del resultado",
-    ),
-    "momento_evaluacion": (
-        "momento de evaluación",
-        "momento de evaluacion",
-        "tiempo de evaluación",
-        "tiempo de evaluacion",
-        "punto temporal",
-        "timepoint",
-        "follow-up del outcome",
-    ),
-    "columna_dataset_outcome": (
-        "columna del outcome",
-        "columna del dataset",
-        "variable en la base",
-        "nombre de columna",
-        "campo del dataset",
-    ),
-    "valor_evento": (
-        "valor del evento",
-        "valor positivo",
-        "evento codificado como",
-        "categoría positiva",
-        "categoria positiva",
-    ),
-    "outcome_secundarios": (
-        "desenlaces secundarios",
-        "outcomes secundarios",
-        "endpoints secundarios",
-        "variables secundarias",
-        "resultados secundarios",
-    ),
-}
-
-TEXT_PROTOCOL_FIELDS = {
-    "tipo_diseno",
-    "outcome_primario",
-    "definicion_outcome",
-    "tipo_outcome",
-    "unidad_outcome",
-    "momento_evaluacion",
-    "columna_dataset_outcome",
-    "valor_evento",
-    "outcome_secundarios",
-}
-NUMERIC_PROTOCOL_FIELDS = set(PROTOCOL_FIELD_ALIASES) - TEXT_PROTOCOL_FIELDS
-
-
-def _accentless_text(value: Any) -> str:
-    text = str(value or "").replace("\u00a0", " ")
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    return text.lower()
-
-
-def _parse_locale_number(value: Any) -> float:
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("El valor numérico no es finito.")
-        return number
-
-    text = str(value or "").strip().replace("\u00a0", " ")
-    # Evita interpretar la notación de potencia (1−β) como el valor numérico.
-    text = re.sub(r"^\s*\([^)]*\)\s*", "", text)
-    text = re.sub(r"^\s*1\s*[-−–]\s*(?:beta|β)\s*[:=]?\s*", "", text, flags=re.IGNORECASE)
-    match = re.search(r"[-+]?\d(?:[\d\s.,]*\d)?|[-+]?\d", text)
-    if not match:
-        raise ValueError(f"No se encontró un número en {value!r}.")
-    token = match.group(0).replace(" ", "")
-    if "," in token and "." in token:
-        decimal_sep = "," if token.rfind(",") > token.rfind(".") else "."
-        thousands_sep = "." if decimal_sep == "," else ","
-        token = token.replace(thousands_sep, "").replace(decimal_sep, ".")
-    elif "," in token:
-        parts = token.split(",")
-        token = "".join(parts[:-1]) + "." + parts[-1] if len(parts[-1]) <= 4 else "".join(parts)
-    elif token.count(".") > 1:
-        parts = token.split(".")
-        token = "".join(parts[:-1]) + "." + parts[-1]
-    number = float(token)
-    if not math.isfinite(number):
-        raise ValueError("El valor numérico no es finito.")
-    return number
-
-
-def _extract_docx_text(raw: bytes) -> str:
-    document = Document(io.BytesIO(raw))
-    blocks: list[str] = []
-    for paragraph in document.paragraphs:
-        if paragraph.text.strip():
-            blocks.append(paragraph.text.strip())
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if any(cells):
-                blocks.append("\t".join(cells))
-    for section in document.sections:
-        for paragraph in section.header.paragraphs:
-            if paragraph.text.strip():
-                blocks.append(paragraph.text.strip())
-        for paragraph in section.footer.paragraphs:
-            if paragraph.text.strip():
-                blocks.append(paragraph.text.strip())
-    return "\n".join(blocks)
-
-
-def _extract_pdf_text(raw: bytes) -> str:
-    reader = PdfReader(io.BytesIO(raw))
-    if reader.is_encrypted:
-        try:
-            reader.decrypt("")
-        except Exception as exc:
-            raise ValueError("El PDF está cifrado y no pudo abrirse sin contraseña.") from exc
-    pages = [(page.extract_text() or "").strip() for page in reader.pages]
-    return "\n\n".join(page for page in pages if page)
-
-
-def _extract_legacy_doc_text(raw: bytes) -> tuple[str, list[str]]:
-    warnings: list[str] = []
-    with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
-        tmp.write(raw)
-        temp_path = tmp.name
-    try:
-        for command_name in ("antiword", "catdoc"):
-            executable = shutil.which(command_name)
-            if executable:
-                completed = subprocess.run(
-                    [executable, temp_path],
-                    check=False,
-                    capture_output=True,
-                    timeout=30,
-                )
-                if completed.returncode == 0 and completed.stdout.strip():
-                    for encoding in ("utf-8", "latin-1"):
-                        try:
-                            text = completed.stdout.decode(encoding)
-                            if text.strip():
-                                return text, warnings
-                        except UnicodeDecodeError:
-                            continue
-
-        # Rescate heurístico para Word binario cuando antiword/catdoc no están instalados.
-        ascii_chunks = [m.decode("latin-1", errors="ignore") for m in re.findall(rb"[\x20-\x7e\xa0-\xff]{5,}", raw)]
-        utf16_chunks: list[str] = []
-        for match in re.findall(rb"(?:[\x20-\x7e\xa0-\xff]\x00){5,}", raw):
-            try:
-                utf16_chunks.append(match.decode("utf-16le", errors="ignore"))
-            except Exception:
-                pass
-        text = "\n".join(dict.fromkeys(chunk.strip() for chunk in utf16_chunks + ascii_chunks if chunk.strip()))
-        warnings.append(
-            "El archivo .DOC legado se leyó mediante recuperación heurística. Para máxima confiabilidad, guárdelo como DOCX."
-        )
-        return text, warnings
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-
-def extract_protocol_text(raw: bytes, suffix: str) -> tuple[str, list[str]]:
-    warnings: list[str] = []
-    if suffix == ".pdf":
-        text = _extract_pdf_text(raw)
-        if len(text.strip()) < 30:
-            raise ValueError(
-                "No se detectó texto utilizable en el PDF. Si es un documento escaneado, aplique OCR o conviértalo a PDF con texto seleccionable."
-            )
-        return text, warnings
-    if suffix in {".docx", ".docm"}:
-        text = _extract_docx_text(raw)
-        if len(text.strip()) < 20:
-            raise ValueError("El archivo Word no contiene texto utilizable.")
-        return text, warnings
-    if suffix == ".doc":
-        text, legacy_warnings = _extract_legacy_doc_text(raw)
-        warnings.extend(legacy_warnings)
-        if len(text.strip()) < 20:
-            raise ValueError("No fue posible recuperar texto del archivo .DOC. Conviértalo a DOCX.")
-        return text, warnings
-    raise ValueError("Formato documental no compatible.")
-
-
-def _value_after_alias(lines: list[str], aliases: tuple[str, ...]) -> str | None:
-    normalized_aliases = sorted({_accentless_text(alias).strip() for alias in aliases}, key=len, reverse=True)
-    for index, line in enumerate(lines):
-        normalized_line = _accentless_text(line)
-        for alias in normalized_aliases:
-            position = normalized_line.find(alias)
-            if position < 0:
-                continue
-            tail = line[position + len(alias):].strip()
-            tail = re.sub(r"^[\s\t:=\-–—·•()\[\]]+", "", tail).strip()
-            if tail:
-                return tail
-            if index + 1 < len(lines):
-                next_line = lines[index + 1].strip()
-                if next_line:
-                    return next_line
-    return None
-
-
-def infer_design_from_text(text: str) -> str | None:
-    token = normalize_token(text)
-
-    def has(*parts: str) -> bool:
-        return any(normalize_token(part) in token for part in parts)
-
-    binary_hint = has("dicotomica", "binaria", "proporcion", "evento", "respuesta si no", "tasa")
-    continuous_hint = has("continua", "media", "promedio", "desviacion estandar")
-
-    if has("mcnemar"):
-        return "mcnemar"
-    if has("validacion diagnostica", "precision diagnostica") or (has("sensibilidad") and has("especificidad")):
-        return "diagnostic_accuracy"
-    if has("mantel cox", "log rank", "logrank", "curvas de supervivencia", "hazard ratio"):
-        return "survival"
-    if has("odds ratio", "razon de momios"):
-        return "odds_ratio"
-    if has("riesgo relativo", "relative risk"):
-        return "risk_ratio"
-    if has("no inferioridad", "no-inferioridad"):
-        return "noninferiority_binary" if binary_hint and not continuous_hint else "noninferiority_continuous"
-    if has("equivalencia", "tost"):
-        return "equivalence_binary" if binary_hint and not continuous_hint else "equivalence_continuous"
-    if has("superioridad"):
-        return "superiority_binary" if binary_hint and not continuous_hint else "superiority_continuous"
-    if has("medias apareadas", "media apareada", "antes y despues", "medidas pareadas"):
-        return "means_paired"
-    if has("proporciones apareadas", "datos apareados dicotomicos"):
-        return "mcnemar"
-    if has("medias independientes", "dos medias independientes", "comparacion de medias independientes"):
-        return "means_independent"
-    if has("proporciones independientes", "dos proporciones independientes", "comparacion de proporciones"):
-        return "proportions_independent"
-    if has("estimacion de una proporcion", "estimacion de proporcion", "prevalencia con precision"):
-        return "proportion_estimation"
-    if has("estimacion de una media", "estimacion de media", "media con precision"):
-        return "mean_estimation"
-    return None
-
-
-
-def _clean_outcome_value(value: Any) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip(" \t:;-–—.\n")
-    text = re.sub(
-        r"^(?:sera|será|es|fue|se define como|se definio como|se definió como|consiste en|consistira en|consistirá en)\s+",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return text.strip(" .;:")
-
-
-def infer_outcome_type(value: Any, design_code: str | None = None) -> str:
-    token = normalize_token(value)
-
-    explicit_patterns = {
-        "time_to_event": ("tiempo_hasta_evento", "time_to_event", "supervivencia", "hazard", "mortalidad_hasta"),
-        "diagnostic": ("diagnostica", "diagnostico", "sensibilidad", "especificidad", "area_bajo_la_curva", "auc"),
-        "paired_binary": ("binaria_apareada", "dicotomica_apareada", "mcnemar"),
-        "binary": ("binaria", "binario", "dicotomica", "dicotomico", "si_no", "presencia_ausencia", "incidencia", "evento", "mortalidad"),
-        "ordinal": ("ordinal", "likert", "grado", "clase_funcional"),
-        "count": ("conteo", "numero_de_eventos", "tasa_de_eventos", "recuento"),
-        "continuous": ("continua", "continuo", "cuantitativa", "cuantitativo", "media", "promedio", "cambio", "reduccion", "incremento"),
-    }
-    for outcome_type, patterns in explicit_patterns.items():
-        if any(pattern in token for pattern in patterns):
-            return outcome_type
-
-    if design_code:
-        expected = DESIGN_OUTCOME_TYPES.get(design_code, set())
-        if len(expected) == 1:
-            return next(iter(expected))
-        if design_code == "mcnemar":
-            return "paired_binary"
-        if design_code == "diagnostic_accuracy":
-            return "diagnostic"
-
-    return "unknown"
-
-
-def infer_outcome_unit(text: Any) -> str:
-    value = str(text or "")
-    patterns = [
-        r"\bmm\s*hg\b",
-        r"\bmg\s*/\s*d[lL]\b",
-        r"\bmmol\s*/\s*[lL]\b",
-        r"\bg\s*/\s*d[lL]\b",
-        r"\bml\s*/\s*min(?:\s*/\s*1[,.]73\s*m(?:2|²))?\b",
-        r"\bkg\s*/\s*m(?:2|²)\b",
-        r"\bm/s\b",
-        r"\bms\b",
-        r"\bbpm\b",
-        r"\bkg\b",
-        r"\bcm\b",
-        r"\bmm\b",
-        r"\b%\b",
-        r"\bpuntos?\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, value, flags=re.IGNORECASE)
-        if match:
-            return re.sub(r"\s+", "", match.group(0)).replace("²", "2")
-    return ""
-
-
-def infer_outcome_timepoint(text: Any) -> str:
-    value = re.sub(r"\s+", " ", str(text or ""))
-    patterns = [
-        r"(?:a|al|a las|en la|en el)\s+(?:semana|día|dia|mes|año|ano)\s*\d+",
-        r"(?:a|al|a las|en)\s+\d+(?:[.,]\d+)?\s*(?:horas?|días?|dias?|semanas?|meses?|años?|anos?)",
-        r"(?:tras|después de|despues de)\s+\d+(?:[.,]\d+)?\s*(?:horas?|días?|dias?|semanas?|meses?|años?|anos?)",
-        r"(?:hasta|durante)\s+\d+(?:[.,]\d+)?\s*(?:horas?|días?|dias?|semanas?|meses?|años?|anos?)",
-        r"(?:basal|fin del seguimiento|alta hospitalaria)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, value, flags=re.IGNORECASE)
-        if match:
-            return match.group(0).strip(" .;:")
-    return ""
-
-
-def design_compatible_with_outcome(design_code: str, outcome_type: str) -> bool:
-    if outcome_type == "unknown":
-        return True
-    return outcome_type in DESIGN_OUTCOME_TYPES.get(design_code, {outcome_type})
-
-
-def suggested_design_for_outcome(outcome_type: str, current_design: str | None = None) -> str | None:
-    if current_design and design_compatible_with_outcome(current_design, outcome_type):
-        return current_design
-    suggestions = {
-        "continuous": "means_independent",
-        "binary": "proportions_independent",
-        "paired_binary": "mcnemar",
-        "time_to_event": "survival",
-        "diagnostic": "diagnostic_accuracy",
-        "ordinal": "proportion_estimation",
-        "count": "proportion_estimation",
-    }
-    return suggestions.get(outcome_type)
-
-
-def _canonicalize_outcome_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    aliases = {
-        "nombre": "outcome_primario",
-        "name": "outcome_primario",
-        "outcome": "outcome_primario",
-        "desenlace": "outcome_primario",
-        "endpoint": "outcome_primario",
-        "definicion": "definicion_outcome",
-        "definition": "definicion_outcome",
-        "tipo": "tipo_outcome",
-        "outcome_type": "tipo_outcome",
-        "unidad": "unidad_outcome",
-        "unit": "unidad_outcome",
-        "momento": "momento_evaluacion",
-        "timepoint": "momento_evaluacion",
-        "columna": "columna_dataset_outcome",
-        "column": "columna_dataset_outcome",
-        "valor_positivo": "valor_evento",
-        "positive_value": "valor_evento",
-        "rol": "rol_outcome",
-        "role": "rol_outcome",
-        "primary": "es_primario",
-        "coprimary": "es_coprimario",
-    }
-    canonical: dict[str, Any] = {}
-    for key, value in entry.items():
-        token = normalize_token(key)
-        canonical[aliases.get(token, token)] = value
-    if canonical.get("outcome_primario"):
-        canonical["outcome_primario"] = _clean_outcome_value(canonical["outcome_primario"])
-    role_token = normalize_token(canonical.get("rol_outcome", ""))
-    canonical["es_primario"] = bool(canonical.get("es_primario")) or role_token in {"primario", "primary"}
-    canonical["es_coprimario"] = bool(canonical.get("es_coprimario")) or role_token in {
-        "coprimario",
-        "co_primario",
-        "coprimary",
-    }
-    return canonical
-
-
-def extract_structured_outcomes(data: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("outcomes", "desenlaces", "endpoints", "variables_resultado"):
-        raw = data.get(key)
-        if isinstance(raw, list):
-            return [_canonicalize_outcome_entry(item) for item in raw if isinstance(item, dict)]
-    return []
-
-
-def choose_primary_outcome(outcomes: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not outcomes:
-        return None
-    for item in outcomes:
-        if item.get("es_primario"):
-            return item
-    for item in outcomes:
-        if not item.get("es_coprimario"):
-            return item
-    return outcomes[0]
-
-
-def enrich_outcome_fields(protocol: dict[str, Any], source_text: str = "") -> dict[str, Any]:
-    outcome_name = _clean_outcome_value(protocol.get("outcome_primario", ""))
-    if outcome_name:
-        protocol["outcome_primario"] = outcome_name
-    combined = " ".join(
-        str(protocol.get(key, ""))
-        for key in ("outcome_primario", "definicion_outcome", "tipo_outcome", "unidad_outcome", "momento_evaluacion")
-    )
-    if not protocol.get("definicion_outcome") and outcome_name:
-        protocol["definicion_outcome"] = outcome_name
-    design_code = None
-    if protocol.get("tipo_diseno"):
-        try:
-            design_code = resolve_design(protocol["tipo_diseno"])
-        except Exception:
-            design_code = infer_design_from_text(str(protocol["tipo_diseno"]))
-    if not protocol.get("tipo_outcome"):
-        protocol["tipo_outcome"] = infer_outcome_type(combined or source_text, design_code)
-    else:
-        protocol["tipo_outcome"] = infer_outcome_type(protocol["tipo_outcome"], design_code)
-    if not protocol.get("unidad_outcome"):
-        unit = infer_outcome_unit(combined or source_text)
-        if unit:
-            protocol["unidad_outcome"] = unit
-    if not protocol.get("momento_evaluacion"):
-        timepoint = infer_outcome_timepoint(combined or source_text)
-        if timepoint:
-            protocol["momento_evaluacion"] = timepoint
-    return protocol
-
-
-def _is_binary_series(series: pd.Series) -> bool:
-    values = series.dropna()
-    if values.empty:
-        return False
-    unique_count = int(values.nunique(dropna=True))
-    return unique_count <= 2 or pd.api.types.is_bool_dtype(values)
-
-
-def _is_low_cardinality_series(series: pd.Series, max_categories: int = 10) -> bool:
-    values = series.dropna()
-    return not values.empty and int(values.nunique(dropna=True)) <= max_categories
-
-
-def outcome_column_candidates(
-    df: pd.DataFrame,
-    outcome_name: str,
-    outcome_type: str,
-    preferred_column: str | None = None,
-) -> list[dict[str, Any]]:
-    target = normalize_token(outcome_name)
-    target_tokens = {token for token in target.split("_") if len(token) > 1}
-    candidates: list[dict[str, Any]] = []
-    for column in df.columns:
-        column_text = str(column)
-        normalized = normalize_token(column_text)
-        column_tokens = {token for token in normalized.split("_") if len(token) > 1}
-        sequence = SequenceMatcher(None, target, normalized).ratio() if target and normalized else 0.0
-        union = target_tokens | column_tokens
-        overlap = len(target_tokens & column_tokens) / len(union) if union else 0.0
-        substring = 1.0 if target and (target in normalized or normalized in target) else 0.0
-        preferred = 1.0 if preferred_column and normalize_token(preferred_column) == normalized else 0.0
-        series = df[column]
-        compatible = True
-        if outcome_type == "continuous":
-            compatible = pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
-        elif outcome_type in {"binary", "paired_binary", "diagnostic"}:
-            compatible = _is_binary_series(series)
-        elif outcome_type == "ordinal":
-            compatible = _is_low_cardinality_series(series)
-        elif outcome_type == "time_to_event":
-            compatible = pd.api.types.is_numeric_dtype(series) or any(
-                word in normalized for word in ("tiempo", "time", "dias", "days", "seguimiento", "followup", "evento")
-            )
-        type_bonus = 0.12 if compatible else -0.12
-        clinical_bonus = 0.0
-        clinical_aliases = {
-            "presion_arterial_sistolica": ("pas", "sbp"),
-            "presion_arterial_diastolica": ("pad", "dbp"),
-            "frecuencia_cardiaca": ("fc", "hr"),
-            "colesterol_ldl": ("ldl",),
-            "hemoglobina_glicosilada": ("hba1c",),
-        }
-        for phrase, abbreviations in clinical_aliases.items():
-            if phrase in target and any(abbreviation in normalized.split("_") or normalized.startswith(abbreviation) for abbreviation in abbreviations):
-                clinical_bonus = 0.28
-                break
-        if preferred:
-            score = 0.99 if compatible else 0.82
-        elif target and target == normalized:
-            score = 0.97 if compatible else 0.80
-        else:
-            score = min(max(0.44 * sequence + 0.30 * overlap + 0.08 * substring + clinical_bonus + type_bonus, 0.0), 1.0)
-        candidates.append(
-            {
-                "column": column_text,
-                "score": score,
-                "compatible": compatible,
-                "dtype": str(series.dtype),
-                "unique": int(series.nunique(dropna=True)),
-            }
-        )
-    return sorted(candidates, key=lambda item: (item["score"], item["compatible"]), reverse=True)
-
-
-def confidence_label(score: float) -> str:
-    if score >= 0.85:
-        return "Alta"
-    if score >= 0.65:
-        return "Moderada"
-    if score >= 0.45:
-        return "Baja"
-    return "Muy baja"
-
-
-def invalidate_outcome_confirmation() -> None:
-    st.session_state.outcome_confirmed = False
-
-
-def extract_protocol_mapping_from_text(text: str) -> dict[str, Any]:
-    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [re.sub(r"\s+", " ", line).strip() for line in cleaned.split("\n") if line.strip()]
-    protocol: dict[str, Any] = {}
-
-    for field_name, aliases in PROTOCOL_FIELD_ALIASES.items():
-        raw_value = _value_after_alias(lines, aliases)
-        if raw_value is None:
-            continue
-        if field_name in TEXT_PROTOCOL_FIELDS:
-            protocol[field_name] = _clean_outcome_value(raw_value) if field_name == "outcome_primario" else str(raw_value).strip()
-        else:
-            try:
-                protocol[field_name] = _parse_locale_number(raw_value)
-            except ValueError:
-                continue
-
-    if "tipo_diseno" not in protocol:
-        inferred = infer_design_from_text(cleaned)
-        if inferred:
-            protocol["tipo_diseno"] = inferred
-
-    # Parámetros específicos pueden completar los cinco campos mínimos.
-    design_code: str | None = None
-    if protocol.get("tipo_diseno") is not None:
-        try:
-            design_code = resolve_design(protocol["tipo_diseno"])
-        except ValueError:
-            inferred = infer_design_from_text(str(protocol["tipo_diseno"]))
-            if inferred:
-                protocol["tipo_diseno"] = inferred
-                design_code = inferred
-
-    if "efecto_esperado" not in protocol:
-        effect_candidates: dict[str, tuple[str, ...]] = {
-            "diagnostic_accuracy": ("sensibilidad", "especificidad"),
-            "odds_ratio": ("odds_ratio",),
-            "risk_ratio": ("riesgo_relativo",),
-            "survival": ("hazard_ratio",),
-            "noninferiority_continuous": ("margen",),
-            "noninferiority_binary": ("margen",),
-            "equivalence_continuous": ("margen",),
-            "equivalence_binary": ("margen",),
-        }
-        for key in effect_candidates.get(design_code or "", ("margen",)):
-            if key in protocol:
-                protocol["efecto_esperado"] = protocol[key]
-                break
-
-    if "variabilidad_estimada" not in protocol:
-        variability_candidates: dict[str, tuple[str, ...]] = {
-            "diagnostic_accuracy": ("prevalencia",),
-            "odds_ratio": ("proporcion_control", "proporcion_grupo_2"),
-            "risk_ratio": ("proporcion_control", "proporcion_grupo_2"),
-            "survival": ("mortalidad_control",),
-            "proportion_estimation": ("precision", "proporcion_esperada"),
-            "noninferiority_binary": ("proporcion_grupo_2",),
-            "equivalence_binary": ("proporcion_grupo_2",),
-        }
-        for key in variability_candidates.get(design_code or "", ()):
-            if key in protocol:
-                protocol["variabilidad_estimada"] = protocol[key]
-                break
-
-    return enrich_outcome_fields(protocol, cleaned)
-
-
-def canonicalize_protocol_mapping(data: dict[str, Any]) -> dict[str, Any]:
-    canonical: dict[str, Any] = {}
-    alias_lookup: dict[str, str] = {}
-    for canonical_name, aliases in PROTOCOL_FIELD_ALIASES.items():
-        alias_lookup[normalize_token(canonical_name)] = canonical_name
-        for alias in aliases:
-            alias_lookup[normalize_token(alias)] = canonical_name
-
-    for key, value in data.items():
-        canonical_key = alias_lookup.get(normalize_token(key), normalize_token(key))
-        canonical[canonical_key] = value
-    return canonical
-
-
 def parse_protocol(uploaded_file: Any) -> dict[str, Any]:
     raw = uploaded_file.getvalue()
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
-    extraction_warnings: list[str] = []
-    extracted_text = ""
-
     if suffix == ".json":
         data = json.loads(raw.decode("utf-8-sig"))
     elif suffix in {".yaml", ".yml"}:
         data = yaml.safe_load(raw.decode("utf-8-sig"))
-    elif suffix in {".pdf", ".docx", ".docm", ".doc"}:
-        extracted_text, extraction_warnings = extract_protocol_text(raw, suffix)
-        data = extract_protocol_mapping_from_text(extracted_text)
     else:
-        raise ValueError("El protocolo debe ser JSON, YAML, PDF o Word (DOCX/DOCM/DOC).")
-
+        raise ValueError("El protocolo debe ser JSON, YAML o YML.")
     if not isinstance(data, dict):
-        raise ValueError("El archivo de protocolo debe contener parámetros identificables.")
-    data = canonicalize_protocol_mapping(data)
-
-    structured_outcomes = extract_structured_outcomes(data)
-    primary_outcome = choose_primary_outcome(structured_outcomes)
-    if primary_outcome:
-        for key in (
-            "outcome_primario",
-            "definicion_outcome",
-            "tipo_outcome",
-            "unidad_outcome",
-            "momento_evaluacion",
-            "columna_dataset_outcome",
-            "valor_evento",
-        ):
-            if data.get(key) in (None, "") and primary_outcome.get(key) not in (None, ""):
-                data[key] = primary_outcome[key]
-        data["_outcomes"] = structured_outcomes
-
-    data = enrich_outcome_fields(data, extracted_text)
-
-    # Convierte campos numéricos aun cuando JSON/YAML los hayan guardado como texto con coma o porcentaje.
-    for key in list(data):
-        if key in NUMERIC_PROTOCOL_FIELDS and data[key] not in (None, ""):
-            data[key] = _parse_locale_number(data[key])
-
-    if data.get("tipo_diseno") is None and extracted_text:
-        inferred = infer_design_from_text(extracted_text)
-        if inferred:
-            data["tipo_diseno"] = inferred
-
+        raise ValueError("El archivo de protocolo debe contener un objeto clave-valor.")
     required = {"tipo_diseno", "error_alfa", "poder_estadistico", "efecto_esperado", "variabilidad_estimada"}
-    missing = sorted(key for key in required if key not in data or data[key] in (None, ""))
+    missing = sorted(required - set(data))
     if missing:
-        readable = ", ".join(missing)
-        raise ValueError(
-            "No fue posible identificar todos los parámetros obligatorios. Faltan: "
-            + readable
-            + ". En PDF/Word use etiquetas claras, por ejemplo: 'Error alfa: 0,05'."
-        )
-
-    data["_source_format"] = suffix.lstrip(".").upper()
-    data["_extraction_warnings"] = extraction_warnings
-    if extracted_text:
-        data["_text_preview"] = extracted_text[:1500]
+        raise ValueError("Faltan claves obligatorias: " + ", ".join(missing))
     return data
+
 
 def resolve_design(value: Any) -> str:
     token = normalize_token(value)
@@ -1664,12 +608,8 @@ def resolve_design(value: Any) -> str:
         return ALIASES[token]
     # Búsqueda tolerante por palabras del rótulo.
     for code, label in DESIGNS.items():
-        normalized_label = normalize_token(label)
-        if token == normalized_label or token in normalized_label or normalized_label in token:
+        if token == normalize_token(label) or token in normalize_token(label):
             return code
-    inferred = infer_design_from_text(str(value))
-    if inferred:
-        return inferred
     raise ValueError(f"tipo_diseno no reconocido: {value!r}")
 
 
@@ -1692,64 +632,42 @@ def apply_protocol_to_state(protocol: dict[str, Any]) -> None:
         raise ValueError("efecto_esperado y variabilidad_estimada deben ser valores numéricos finitos.")
 
     def bounded_probability(value: float, fallback: float = 0.50) -> float:
-        numeric = float(value)
-        if 1 < numeric <= 100:
-            numeric /= 100
-        if 0 <= numeric <= 1:
-            return min(max(numeric, 0.001), 0.999)
+        if 0 < value < 1:
+            return float(value)
         return fallback
-
-    def probability_or_points(value: float) -> float:
-        numeric = abs(float(value))
-        return numeric / 100 if 1 < numeric <= 100 else numeric
 
     st.session_state.design_code = code
     st.session_state.alpha = alpha
     st.session_state.power = power
-    st.session_state.outcome_primary = str(protocol.get("outcome_primario", "") or "")
-    st.session_state.outcome_definition = str(protocol.get("definicion_outcome", "") or "")
-    st.session_state.outcome_type = infer_outcome_type(protocol.get("tipo_outcome", ""), code)
-    st.session_state.outcome_unit = str(protocol.get("unidad_outcome", "") or "")
-    st.session_state.outcome_timepoint = str(protocol.get("momento_evaluacion", "") or "")
-    st.session_state.outcome_secondary = str(protocol.get("outcome_secundarios", "") or "")
-    st.session_state.outcome_preferred_column = str(protocol.get("columna_dataset_outcome", "") or "")
-    st.session_state.outcome_event_value_protocol = str(protocol.get("valor_evento", "") or "")
-    st.session_state.protocol_outcomes = protocol.get("_outcomes", [])
-    st.session_state.outcome_confirmed = False
-    st.session_state.outcome_column_confidence = 0.0
 
     # Interpretación automática de los dos parámetros genéricos según el diseño.
-    if code == "mean_estimation":
-        st.session_state.precision_mean = max(abs(effect), 0.0001)
-        st.session_state.sd = max(abs(variability), 0.0001)
-    elif code in {"means_independent", "means_paired", "superiority_continuous"}:
+    if code in {"mean_estimation", "means_independent", "means_paired", "superiority_continuous"}:
         st.session_state.delta = max(abs(effect), 0.0001)
         st.session_state.sd = max(abs(variability), 0.0001)
         st.session_state.sd_diff = max(abs(variability), 0.0001)
     elif code == "proportion_estimation":
         st.session_state.p = bounded_probability(effect)
-        st.session_state.precision_prop = max(min(probability_or_points(variability), 0.50), 0.001)
+        st.session_state.precision_prop = max(min(abs(variability), 0.50), 0.001)
     elif code in {"proportions_independent", "superiority_binary"}:
         baseline = bounded_probability(variability)
-        absolute_effect = probability_or_points(effect)
         st.session_state.p2 = baseline
-        st.session_state.p1 = min(max(baseline + absolute_effect, 0.001), 0.999)
+        st.session_state.p1 = min(max(baseline + effect, 0.001), 0.999)
     elif code in {"noninferiority_continuous", "equivalence_continuous"}:
         st.session_state.margin_cont = max(abs(effect), 0.0001)
         st.session_state.sd = max(abs(variability), 0.0001)
     elif code == "noninferiority_binary":
         baseline = bounded_probability(variability, 0.80)
-        st.session_state.margin_bin = max(min(probability_or_points(effect), 0.50), 0.001)
+        st.session_state.margin_bin = max(min(abs(effect), 0.50), 0.001)
         st.session_state.p1_ni = baseline
         st.session_state.p2_ni = baseline
     elif code == "equivalence_binary":
         baseline = bounded_probability(variability, 0.80)
-        st.session_state.margin_bin = max(min(probability_or_points(effect), 0.50), 0.001)
+        st.session_state.margin_bin = max(min(abs(effect), 0.50), 0.001)
         st.session_state.p1_eq = baseline
         st.session_state.p2_eq = baseline
     elif code == "mcnemar":
-        discordance_total = min(max(probability_or_points(variability), 0.01), 0.98)
-        discordance_difference = min(probability_or_points(effect), discordance_total - 0.001)
+        discordance_total = min(max(abs(variability), 0.01), 0.98)
+        discordance_difference = min(abs(effect), discordance_total - 0.001)
         st.session_state.p01 = (discordance_total + discordance_difference) / 2
         st.session_state.p10 = (discordance_total - discordance_difference) / 2
     elif code in {"odds_ratio", "risk_ratio"}:
@@ -1772,13 +690,13 @@ def apply_protocol_to_state(protocol: dict[str, Any]) -> None:
         if code == "mean_estimation":
             st.session_state.precision_mean = max(precision_value, 0.0001)
         elif code == "proportion_estimation":
-            st.session_state.precision_prop = max(min(probability_or_points(precision_value), 0.50), 0.001)
+            st.session_state.precision_prop = max(min(precision_value, 0.50), 0.001)
     if "margen" in protocol and protocol["margen"] is not None:
         margin_value = abs(float(protocol["margen"]))
         if code in {"noninferiority_continuous", "equivalence_continuous"}:
             st.session_state.margin_cont = max(margin_value, 0.0001)
         elif code in {"noninferiority_binary", "equivalence_binary"}:
-            st.session_state.margin_bin = max(min(probability_or_points(margin_value), 0.50), 0.001)
+            st.session_state.margin_bin = max(min(margin_value, 0.50), 0.001)
     if "perdidas_esperadas" in protocol and protocol["perdidas_esperadas"] is not None:
         loss_value = float(protocol["perdidas_esperadas"])
         loss_percent = loss_value * 100 if loss_value <= 1 else loss_value
@@ -1787,10 +705,10 @@ def apply_protocol_to_state(protocol: dict[str, Any]) -> None:
     # Los campos específicos, cuando existen, prevalecen sobre la interpretación genérica.
     if "proporcion_grupo_1" in protocol and protocol["proporcion_grupo_1"] is not None:
         target = "p1_eq" if code == "equivalence_binary" else "p1_ni" if code == "noninferiority_binary" else "p1"
-        st.session_state[target] = bounded_probability(protocol["proporcion_grupo_1"])
+        st.session_state[target] = protocol["proporcion_grupo_1"]
     if "proporcion_grupo_2" in protocol and protocol["proporcion_grupo_2"] is not None:
         target = "p2_eq" if code == "equivalence_binary" else "p2_ni" if code == "noninferiority_binary" else "p2"
-        st.session_state[target] = bounded_probability(protocol["proporcion_grupo_2"])
+        st.session_state[target] = protocol["proporcion_grupo_2"]
 
     optional_map = {
         "proporcion_esperada": "p",
@@ -1810,25 +728,9 @@ def apply_protocol_to_state(protocol: dict[str, Any]) -> None:
         "p01": "p01",
         "p10": "p10",
     }
-    probability_fields = {
-        "proporcion_esperada",
-        "proporcion_control",
-        "prevalencia",
-        "sensibilidad",
-        "especificidad",
-        "precision_sensibilidad",
-        "precision_especificidad",
-        "mortalidad_control",
-        "mortalidad_tratamiento",
-        "p01",
-        "p10",
-    }
     for source_key, state_key in optional_map.items():
         if source_key in protocol and protocol[source_key] is not None:
-            value = protocol[source_key]
-            if source_key in probability_fields:
-                value = bounded_probability(value)
-            st.session_state[state_key] = value
+            st.session_state[state_key] = protocol[source_key]
 
 
 def load_dataset(uploaded_file: Any) -> tuple[pd.DataFrame | None, dict[str, Any]]:
@@ -1936,42 +838,23 @@ def add_key_value_table(doc: Document, rows: list[tuple[str, Any]]) -> None:
         cells[1].text = str(value)
 
 
-def consort_paragraph(
-    result: SampleSizeResult,
-    params: dict[str, Any],
-    recommended_total: int | None = None,
-) -> str:
+def consort_paragraph(result: SampleSizeResult, params: dict[str, Any]) -> str:
     alpha = float(params.get("alpha", 0.05))
     power = float(params.get("power", 0.80))
     sided = params.get("sided", "Bilateral").lower()
     losses = float(params.get("loss_rate", 0.0))
     variability = params.get("sd", params.get("sd_diff", "no aplicable"))
     effect = params.get("delta", params.get("margin", params.get("effect_ratio", "según diseño")))
-    outcome = params.get("outcome", {}) or {}
-    outcome_name = outcome.get("outcome_primario") or "desenlace primario preespecificado"
-    outcome_type = outcome.get("tipo_outcome_label") or outcome.get("tipo_outcome") or "no especificado"
-    unit = outcome.get("unidad_outcome") or "sin unidad aplicable"
-    timepoint = outcome.get("momento_evaluacion") or "momento preespecificado"
     power_clause = (
         f"un poder estadístico de {power:.0%}" if result.uses_power else "un criterio de precisión del intervalo de confianza"
     )
-    total_clause = result.n_final_total
-    multiplicity_clause = ""
-    if recommended_total and recommended_total > result.n_final_total:
-        total_clause = recommended_total
-        multiplicity_clause = (
-            f" Debido a la existencia de outcomes coprimarios con parámetros completos, se adoptó el mayor requerimiento, "
-            f"correspondiente a {recommended_total} participantes."
-        )
     return (
-        f"El tamaño de muestra se determinó a priori para el outcome primario '{outcome_name}', de tipo {str(outcome_type).lower()}, "
-        f"medido en {unit} y evaluado en {timepoint}, mediante {result.method.lower()} "
+        f"El tamaño de muestra se determinó a priori para el desenlace principal mediante {result.method.lower()} "
         f"Se asumió un error alfa de {alpha:.3f}, un contraste {sided}, {power_clause}, "
         f"un efecto o margen de {effect} y una variabilidad/proporción basal de {variability}. "
         f"El cálculo inicial fue de {math.ceil(result.n_raw_total)} participantes y se ajustó por una pérdida esperada "
-        f"de {losses:.1%}, obteniéndose un requerimiento final de {total_clause}."
-        f"{multiplicity_clause} Estos parámetros, la definición operacional del outcome, su momento de evaluación, "
-        "la fuente del efecto clínicamente relevante y cualquier modificación posterior deberán declararse en Métodos, "
+        f"de {losses:.1%}, obteniéndose un requerimiento final de {result.n_final_total}. "
+        "Estos parámetros, su fuente clínica y cualquier modificación posterior deberán declararse en Métodos, "
         "de acuerdo con el ítem de tamaño de muestra de CONSORT 2010."
     )
 
@@ -1981,8 +864,6 @@ def build_word_report(
     params: dict[str, Any],
     sensitivity_df: pd.DataFrame,
     dataset_metadata: dict[str, Any] | None,
-    coprimary_df: pd.DataFrame | None = None,
-    recommended_total: int | None = None,
 ) -> bytes:
     doc = Document()
     set_doc_defaults(doc)
@@ -1993,43 +874,19 @@ def build_word_report(
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subtitle.add_run(f"{APP_NAME} · v{APP_VERSION} · {datetime.now():%d/%m/%Y %H:%M}")
 
-    outcome = params.get("outcome", {}) or {}
-    final_recommendation = int(recommended_total or result.n_final_total)
-
     doc.add_heading("1. Resumen del diseño", level=1)
     doc.add_paragraph(result.design_label)
     add_key_value_table(
         doc,
         [
-            ("N total recomendado", final_recommendation),
-            ("N del outcome primario confirmado", result.n_final_total),
+            ("N total recomendado", result.n_final_total),
             ("N inicial sin pérdidas", math.ceil(result.n_raw_total)),
             ("Método", result.method),
             ("Distribución", "; ".join(f"{k}: {v}" for k, v in result.groups_final.items())),
         ],
     )
 
-    doc.add_heading("2. Outcome primario y trazabilidad", level=1)
-    add_key_value_table(
-        doc,
-        [
-            ("Outcome primario", outcome.get("outcome_primario", "")),
-            ("Definición operacional", outcome.get("definicion_outcome", "")),
-            ("Tipo", outcome.get("tipo_outcome_label", outcome.get("tipo_outcome", ""))),
-            ("Unidad", outcome.get("unidad_outcome", "")),
-            ("Momento de evaluación", outcome.get("momento_evaluacion", "")),
-            ("Columna del dataset", outcome.get("columna_dataset_outcome", "No aplicada")),
-            ("Confianza de vinculación", f"{float(outcome.get('confianza_columna', 0.0)):.0%}" if dataset_metadata else "No aplicada"),
-            ("Valor del evento", outcome.get("valor_evento", "")),
-            ("Confirmado por el investigador", "Sí" if outcome.get("confirmado") else "No"),
-        ],
-    )
-    if outcome.get("outcome_secundarios"):
-        p = doc.add_paragraph()
-        p.add_run("Outcomes secundarios/coprimarios declarados: ").bold = True
-        p.add_run(str(outcome.get("outcome_secundarios")))
-
-    doc.add_heading("3. Justificación matemática", level=1)
+    doc.add_heading("2. Justificación matemática", level=1)
     doc.add_paragraph(result.formula)
     doc.add_paragraph("Supuestos utilizados: " + "; ".join(result.assumptions) + ".")
     if result.warnings:
@@ -2037,35 +894,17 @@ def build_word_report(
         p.add_run("Advertencias metodológicas: ").bold = True
         p.add_run(" ".join(result.warnings))
 
-    if coprimary_df is not None and not coprimary_df.empty:
-        doc.add_heading("4. Evaluación de outcomes primarios/coprimarios", level=1)
-        doc.add_paragraph(
-            "Cuando el protocolo aportó parámetros completos para más de un outcome primario o coprimario, se calculó cada escenario por separado. "
-            "La recomendación global adopta el mayor tamaño de muestra para evitar que uno de los outcomes quede insuficientemente dimensionado."
-        )
-        table = doc.add_table(rows=1, cols=len(coprimary_df.columns))
-        table.style = "Table Grid"
-        for idx, column in enumerate(coprimary_df.columns):
-            table.rows[0].cells[idx].text = str(column)
-        for _, row in coprimary_df.iterrows():
-            cells = table.add_row().cells
-            for idx, value in enumerate(row):
-                cells[idx].text = str(value)
-        next_section = 5
-    else:
-        next_section = 4
-
-    doc.add_heading(f"{next_section}. Diferencia mínima clínicamente importante", level=1)
+    doc.add_heading("3. Diferencia mínima clínicamente importante", level=1)
     doc.add_paragraph(
         "El efecto esperado debe representar la diferencia mínima que modificaría una decisión clínica, no la diferencia "
         "que simplemente podría alcanzar significación estadística. Su valor debe justificarse con literatura previa, "
         "datos piloto o consenso clínico-estadístico."
     )
 
-    doc.add_heading(f"{next_section + 1}. Párrafo para reporte CONSORT 2010", level=1)
-    doc.add_paragraph(consort_paragraph(result, params, final_recommendation))
+    doc.add_heading("4. Párrafo para reporte CONSORT 2010", level=1)
+    doc.add_paragraph(consort_paragraph(result, params))
 
-    doc.add_heading(f"{next_section + 2}. Análisis de sensibilidad", level=1)
+    doc.add_heading("5. Análisis de sensibilidad", level=1)
     table = doc.add_table(rows=1, cols=len(sensitivity_df.columns))
     table.style = "Table Grid"
     for idx, column in enumerate(sensitivity_df.columns):
@@ -2075,19 +914,17 @@ def build_word_report(
         for idx, value in enumerate(row):
             cells[idx].text = str(value)
 
-    section_number = next_section + 3
     if dataset_metadata:
-        doc.add_heading(f"{section_number}. Fuente de datos importada", level=1)
+        doc.add_heading("6. Fuente de datos importada", level=1)
         doc.add_paragraph(
             "; ".join(f"{k}: {v}" for k, v in dataset_metadata.items() if k != "temp_path")
         )
-        section_number += 1
 
-    doc.add_heading(f"{section_number}. Trazabilidad y límites", level=1)
+    doc.add_heading("7. Trazabilidad y límites", level=1)
     doc.add_paragraph(
-        "Este informe documenta un cálculo de planificación. La detección automática del outcome y de su columna es una propuesta asistida y no reemplaza la confirmación clínica. "
-        "Los diseños con múltiples desenlaces, análisis intermedios, conglomerados, estratificación, multiplicidad, riesgos no proporcionales o requisitos regulatorios "
-        "deben validarse con un bioestadístico y, cuando corresponda, mediante simulación."
+        "Este informe documenta un cálculo de planificación. Los diseños con múltiples desenlaces, análisis intermedios, "
+        "conglomerados, estratificación, multiplicidad, riesgos no proporcionales o requisitos regulatorios deben validarse "
+        "con un bioestadístico y, cuando corresponda, mediante simulación."
     )
 
     bio = io.BytesIO()
@@ -2176,83 +1013,6 @@ def build_consort_pdf() -> bytes:
     return bio.getvalue()
 
 
-
-def _protocol_display_rows(protocol: dict[str, Any]) -> list[tuple[str, str]]:
-    labels = {
-        "tipo_diseno": "Tipo de diseño",
-        "error_alfa": "Error alfa",
-        "poder_estadistico": "Poder estadístico",
-        "efecto_esperado": "Efecto esperado",
-        "variabilidad_estimada": "Variabilidad estimada",
-        "perdidas_esperadas": "Pérdidas esperadas",
-        "outcome_primario": "Desenlace primario",
-        "definicion_outcome": "Definición del desenlace",
-        "tipo_outcome": "Tipo de outcome",
-        "unidad_outcome": "Unidad del outcome",
-        "momento_evaluacion": "Momento de evaluación",
-        "columna_dataset_outcome": "Columna del dataset",
-        "valor_evento": "Valor del evento",
-        "outcome_secundarios": "Desenlaces secundarios",
-    }
-    return [(labels[key], str(protocol[key])) for key in labels if key in protocol]
-
-
-def build_protocol_docx_template(protocol: dict[str, Any]) -> bytes:
-    document = Document()
-    document.add_heading("Archivo de configuración de protocolo", level=1)
-    document.add_paragraph(
-        "Complete los valores conservando las etiquetas. BioSize Clinical leerá automáticamente este archivo Word."
-    )
-    table = document.add_table(rows=1, cols=2)
-    table.style = "Table Grid"
-    table.rows[0].cells[0].text = "Parámetro"
-    table.rows[0].cells[1].text = "Valor"
-    for label, value in _protocol_display_rows(protocol):
-        cells = table.add_row().cells
-        cells[0].text = label
-        cells[1].text = value
-    document.add_paragraph(
-        "También pueden agregarse parámetros específicos, por ejemplo: prevalencia, sensibilidad, especificidad, margen, hazard ratio o proporciones por grupo."
-    )
-    bio = io.BytesIO()
-    document.save(bio)
-    return bio.getvalue()
-
-
-def build_protocol_pdf_template(protocol: dict[str, Any]) -> bytes:
-    bio = io.BytesIO()
-    doc = SimpleDocTemplate(bio, pagesize=A4, rightMargin=2 * cm, leftMargin=2 * cm, topMargin=2 * cm, bottomMargin=2 * cm)
-    styles = getSampleStyleSheet()
-    story: list[Any] = [
-        Paragraph("Archivo de configuración de protocolo", styles["Title"]),
-        Spacer(1, 0.3 * cm),
-        Paragraph(
-            "Complete los valores conservando las etiquetas. BioSize Clinical leerá automáticamente este PDF cuando contenga texto seleccionable.",
-            styles["BodyText"],
-        ),
-        Spacer(1, 0.4 * cm),
-    ]
-    rows = [["Parámetro", "Valor"]] + [[label, value] for label, value in _protocol_display_rows(protocol)]
-    table = Table(rows, colWidths=[9 * cm, 5 * cm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbe7f0")),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ]
-        )
-    )
-    story.append(table)
-    doc.build(story)
-    return bio.getvalue()
-
-
 # -----------------------------------------------------------------------------
 # Interfaz Streamlit
 # -----------------------------------------------------------------------------
@@ -2316,30 +1076,13 @@ DEFAULTS = {
     "finite_population": False,
     "population": 1000,
     "yates": False,
-    "outcome_primary": "",
-    "outcome_definition": "",
-    "outcome_type": "unknown",
-    "outcome_unit": "",
-    "outcome_timepoint": "",
-    "outcome_secondary": "",
-    "outcome_preferred_column": "",
-    "outcome_dataset_column": "",
-    "outcome_event_value_protocol": "",
-    "outcome_confirmed": False,
-    "outcome_column_confidence": 0.0,
-    "protocol_outcomes": [],
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
 
 with st.sidebar:
     st.header("📥 Importación")
-    protocol_file = st.file_uploader(
-        "Archivo de protocolo",
-        type=["json", "yaml", "yml", "pdf", "docx", "docm", "doc"],
-        key="protocol_upload",
-        help="PDF y Word deben contener texto seleccionable o una tabla con los parámetros del protocolo.",
-    )
+    protocol_file = st.file_uploader("Archivo de protocolo", type=["json", "yaml", "yml"], key="protocol_upload")
     if protocol_file is not None:
         signature = (protocol_file.name, len(protocol_file.getvalue()), hash(protocol_file.getvalue()))
         if st.session_state.get("protocol_signature") != signature:
@@ -2347,26 +1090,11 @@ with st.sidebar:
                 protocol = parse_protocol(protocol_file)
                 apply_protocol_to_state(protocol)
                 st.session_state.protocol_signature = signature
-                st.session_state.protocol_loaded_message = (
-                    f"Protocolo aplicado: {protocol_file.name} · formato {protocol.get('_source_format', '')}"
-                )
-                st.session_state.protocol_detected = {
-                    key: value for key, value in protocol.items() if not key.startswith("_")
-                }
-                st.session_state.protocol_extraction_warnings = protocol.get("_extraction_warnings", [])
-                st.session_state.protocol_text_preview = protocol.get("_text_preview", "")
+                st.session_state.protocol_loaded_message = f"Protocolo aplicado: {protocol_file.name}"
             except Exception as exc:
                 st.error(str(exc))
     if st.session_state.get("protocol_loaded_message"):
         st.success(st.session_state.protocol_loaded_message)
-    for warning in st.session_state.get("protocol_extraction_warnings", []):
-        st.warning(warning)
-    if st.session_state.get("protocol_detected"):
-        with st.expander("Parámetros detectados", expanded=False):
-            st.json(st.session_state.protocol_detected)
-    if st.session_state.get("protocol_text_preview"):
-        with st.expander("Vista previa del texto extraído", expanded=False):
-            st.text(st.session_state.protocol_text_preview)
 
     data_file = st.file_uploader("Dataset", type=["xlsx", "xlsm", "csv", "sqlite", "sqlite3", "db"], key="data_upload")
     dataset: pd.DataFrame | None = None
@@ -2374,11 +1102,6 @@ with st.sidebar:
     if data_file is not None:
         try:
             dataset, dataset_metadata = load_dataset(data_file)
-            dataset_signature = (data_file.name, len(data_file.getvalue()), hash(data_file.getvalue()))
-            if st.session_state.get("dataset_signature") != dataset_signature:
-                st.session_state.dataset_signature = dataset_signature
-                st.session_state.outcome_confirmed = False
-                st.session_state.outcome_column_confidence = 0.0
             st.success(f"{len(dataset):,} filas · {len(dataset.columns)} columnas")
         except Exception as exc:
             st.error(f"No se pudo cargar el dataset: {exc}")
@@ -2392,39 +1115,6 @@ with st.sidebar:
         "efecto_esperado": 5.0,
         "variabilidad_estimada": 10.0,
         "perdidas_esperadas": 0.10,
-        "outcome_primario": "Presión arterial sistólica a las 12 semanas",
-        "definicion_outcome": "Cambio de la presión arterial sistólica desde el valor basal hasta la semana 12",
-        "tipo_outcome": "continuo",
-        "unidad_outcome": "mmHg",
-        "momento_evaluacion": "12 semanas",
-        "columna_dataset_outcome": "PAS_12semanas",
-        "outcome_secundarios": "Presión arterial diastólica y proporción de pacientes controlados",
-    }
-    sample_coprimary_protocol = {
-        "tipo_diseno": "medias_independientes",
-        "error_alfa": 0.05,
-        "poder_estadistico": 0.80,
-        "efecto_esperado": 5.0,
-        "variabilidad_estimada": 10.0,
-        "perdidas_esperadas": 0.10,
-        "outcomes": [
-            {
-                "nombre": "Presión arterial sistólica a las 12 semanas",
-                "rol": "primario",
-                "tipo": "continuo",
-                "tipo_diseno": "medias_independientes",
-                "efecto_esperado": 5.0,
-                "variabilidad_estimada": 10.0,
-            },
-            {
-                "nombre": "Presión arterial diastólica a las 12 semanas",
-                "rol": "coprimario",
-                "tipo": "continuo",
-                "tipo_diseno": "medias_independientes",
-                "efecto_esperado": 3.0,
-                "variabilidad_estimada": 10.0,
-            },
-        ],
     }
     st.download_button(
         "Descargar JSON de ejemplo",
@@ -2440,30 +1130,6 @@ with st.sidebar:
         mime="application/x-yaml",
         use_container_width=True,
     )
-    st.download_button(
-        "Descargar JSON con outcomes coprimarios",
-        data=json.dumps(sample_coprimary_protocol, indent=2, ensure_ascii=False).encode("utf-8"),
-        file_name="protocolo_coprimarios_ejemplo.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-    try:
-        st.download_button(
-            "Descargar Word de ejemplo",
-            data=build_protocol_docx_template(sample_protocol),
-            file_name="protocolo_ejemplo.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
-        st.download_button(
-            "Descargar PDF de ejemplo",
-            data=build_protocol_pdf_template(sample_protocol),
-            file_name="protocolo_ejemplo.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-    except Exception as exc:
-        st.caption(f"No se pudieron generar las plantillas documentales: {exc}")
 
 st.markdown(
     """
@@ -2483,7 +1149,6 @@ with left:
         options=list(DESIGNS.keys()),
         format_func=lambda x: DESIGNS[x],
         key="design_code",
-        on_change=invalidate_outcome_confirmation,
     )
 with right:
     no_variability = st.checkbox("No dispongo de una estimación confiable de variabilidad", key="no_variability")
@@ -2499,230 +1164,6 @@ if no_variability and design_code in {
     st.warning(
         "Se recomienda realizar primero un estudio piloto de aproximadamente 30–50 sujetos para estimar la desviación estándar o la variabilidad de las diferencias."
     )
-
-
-st.subheader("🎯 Desenlace primario")
-st.caption(
-    "La app propone el outcome a partir del protocolo, pero el investigador debe confirmar su definición y, cuando exista un dataset, la columna correspondiente antes de calcular."
-)
-
-outcome_top_1, outcome_top_2, outcome_top_3, outcome_top_4 = st.columns([1.7, 1.0, 0.8, 0.9])
-with outcome_top_1:
-    outcome_primary = st.text_input(
-        "Nombre del outcome primario",
-        key="outcome_primary",
-        placeholder="Ej.: Presión arterial sistólica a las 12 semanas",
-        on_change=invalidate_outcome_confirmation,
-    )
-with outcome_top_2:
-    outcome_type = st.selectbox(
-        "Tipo de outcome",
-        options=list(OUTCOME_TYPE_LABELS.keys()),
-        format_func=lambda code: OUTCOME_TYPE_LABELS[code],
-        key="outcome_type",
-        on_change=invalidate_outcome_confirmation,
-    )
-with outcome_top_3:
-    outcome_unit = st.text_input(
-        "Unidad",
-        key="outcome_unit",
-        placeholder="mmHg",
-        on_change=invalidate_outcome_confirmation,
-    )
-with outcome_top_4:
-    outcome_timepoint = st.text_input(
-        "Momento de evaluación",
-        key="outcome_timepoint",
-        placeholder="12 semanas",
-        on_change=invalidate_outcome_confirmation,
-    )
-
-outcome_definition = st.text_area(
-    "Definición operacional del outcome",
-    key="outcome_definition",
-    placeholder="Defina exactamente qué se mide, cómo se calcula y en qué momento.",
-    height=82,
-    on_change=invalidate_outcome_confirmation,
-)
-outcome_secondary = st.text_area(
-    "Outcomes secundarios o coprimarios declarados",
-    key="outcome_secondary",
-    placeholder="Opcional. Identifique explícitamente cuáles son coprimarios.",
-    height=68,
-    on_change=invalidate_outcome_confirmation,
-)
-
-if outcome_primary and outcome_type == "unknown":
-    inferred_type = infer_outcome_type(outcome_primary + " " + outcome_definition, design_code)
-    if inferred_type != "unknown":
-        st.info(f"Tipo sugerido por el texto y el diseño: **{OUTCOME_TYPE_LABELS[inferred_type]}**.")
-        if st.button("Aplicar tipo sugerido", key="apply_inferred_outcome_type"):
-            st.session_state.outcome_type = inferred_type
-            st.session_state.outcome_confirmed = False
-            st.rerun()
-
-if not design_compatible_with_outcome(design_code, outcome_type):
-    suggested_design = suggested_design_for_outcome(outcome_type, design_code)
-    st.warning(
-        f"El diseño seleccionado ({DESIGNS[design_code]}) no es coherente con un outcome {OUTCOME_TYPE_LABELS.get(outcome_type, outcome_type).lower()}."
-    )
-    if suggested_design and st.button(
-        f"Alinear con: {DESIGNS[suggested_design]}",
-        key="align_design_with_outcome",
-    ):
-        st.session_state.design_code = suggested_design
-        st.session_state.outcome_confirmed = False
-        st.rerun()
-
-selected_outcome_column = ""
-outcome_column_score = 0.0
-outcome_event_value: Any = st.session_state.get("outcome_event_value_protocol", "")
-outcome_column_dtype = ""
-outcome_column_unique = None
-outcome_column_valid = True
-
-if dataset is not None:
-    st.markdown("#### Vinculación con el dataset")
-    column_map = {str(column): column for column in dataset.columns}
-    candidates = outcome_column_candidates(
-        dataset,
-        outcome_primary,
-        outcome_type,
-        st.session_state.get("outcome_preferred_column", ""),
-    )
-    ranked_names = [item["column"] for item in candidates]
-    ordered_columns = list(dict.fromkeys(ranked_names + list(column_map.keys())))
-    current_column = str(st.session_state.get("outcome_dataset_column", "") or "")
-    preferred_column = str(st.session_state.get("outcome_preferred_column", "") or "")
-    preferred_match = next(
-        (name for name in ordered_columns if normalize_token(name) == normalize_token(preferred_column)),
-        "",
-    )
-    if current_column not in ordered_columns:
-        if preferred_match:
-            st.session_state.outcome_dataset_column = preferred_match
-        elif candidates and candidates[0]["score"] >= 0.35:
-            st.session_state.outcome_dataset_column = candidates[0]["column"]
-        elif ordered_columns:
-            st.session_state.outcome_dataset_column = ordered_columns[0]
-
-    link_c1, link_c2 = st.columns([1.5, 1.0])
-    with link_c1:
-        selected_outcome_column = st.selectbox(
-            "Columna que representa el outcome primario",
-            options=ordered_columns,
-            key="outcome_dataset_column",
-            on_change=invalidate_outcome_confirmation,
-        )
-    selected_candidate = next((item for item in candidates if item["column"] == selected_outcome_column), None)
-    if selected_candidate:
-        outcome_column_score = float(selected_candidate["score"])
-        outcome_column_dtype = str(selected_candidate["dtype"])
-        outcome_column_unique = int(selected_candidate["unique"])
-        st.session_state.outcome_column_confidence = outcome_column_score
-    with link_c2:
-        st.metric("Confianza de correspondencia", f"{outcome_column_score:.0%}")
-        st.caption(
-            f"{confidence_label(outcome_column_score)} · tipo {outcome_column_dtype or 'no determinado'} · {outcome_column_unique if outcome_column_unique is not None else '—'} valores únicos"
-        )
-
-    if candidates:
-        with st.expander("Alternativas de columna sugeridas", expanded=False):
-            candidate_table = pd.DataFrame(
-                [
-                    {
-                        "Columna": item["column"],
-                        "Confianza": f"{item['score']:.0%}",
-                        "Compatible con el tipo": "Sí" if item["compatible"] else "No",
-                        "Tipo": item["dtype"],
-                        "Valores únicos": item["unique"],
-                    }
-                    for item in candidates[:8]
-                ]
-            )
-            st.dataframe(candidate_table, hide_index=True, use_container_width=True)
-
-    if selected_outcome_column:
-        actual_column = column_map[selected_outcome_column]
-        outcome_series = dataset[actual_column].dropna()
-        if outcome_type in {"binary", "paired_binary", "diagnostic"} and not outcome_series.empty:
-            unique_values = list(outcome_series.unique())[:50]
-            if len(unique_values) > 2:
-                outcome_column_valid = False
-                st.warning(
-                    f"La columna seleccionada contiene {len(unique_values)} categorías. Un outcome binario requiere dos categorías válidas; recodifique o filtre la variable antes de usarla."
-                )
-            current_event = st.session_state.get("outcome_event_value")
-            protocol_event = str(st.session_state.get("outcome_event_value_protocol", "") or "")
-            if current_event not in unique_values:
-                matched_event = next((value for value in unique_values if str(value) == protocol_event), None)
-                st.session_state.outcome_event_value = matched_event if matched_event is not None else unique_values[-1]
-            outcome_event_value = st.selectbox(
-                "Valor considerado evento/resultado positivo",
-                options=unique_values,
-                key="outcome_event_value",
-                on_change=invalidate_outcome_confirmation,
-            )
-            event_rate = float((outcome_series == outcome_event_value).mean())
-            st.caption(f"Frecuencia observada del evento en el dataset: {event_rate:.1%}.")
-        elif outcome_type == "continuous":
-            numeric_outcome = pd.to_numeric(outcome_series, errors="coerce").dropna()
-            if numeric_outcome.empty:
-                outcome_column_valid = False
-                st.error("La columna seleccionada no contiene valores numéricos utilizables para un outcome continuo.")
-            else:
-                stats_c1, stats_c2, stats_c3 = st.columns(3)
-                stats_c1.metric("Observaciones válidas", f"{len(numeric_outcome):,}")
-                stats_c2.metric("Media", f"{numeric_outcome.mean():.3f}")
-                stats_c3.metric("DE", f"{numeric_outcome.std(ddof=1):.3f}" if len(numeric_outcome) > 1 else "—")
-        elif outcome_type == "time_to_event":
-            st.info(
-                "Para el análisis final de supervivencia suelen necesitarse una variable de tiempo y otra de evento. Aquí se confirma la columna principal; documente la segunda variable en la definición operacional."
-            )
-else:
-    st.info("No se cargó un dataset. La confirmación del outcome se realizará únicamente contra el protocolo y la definición clínica.")
-
-structured_outcomes = st.session_state.get("protocol_outcomes", [])
-if structured_outcomes:
-    with st.expander("Outcomes estructurados detectados en el protocolo", expanded=False):
-        st.dataframe(pd.DataFrame(structured_outcomes), hide_index=True, use_container_width=True)
-    coprimary_count = sum(
-        1 for item in structured_outcomes if item.get("es_primario") or item.get("es_coprimario")
-    )
-    if coprimary_count > 1:
-        st.warning(
-            "Se detectaron varios outcomes primarios/coprimarios. La app calculará escenarios adicionales cuando cada uno contenga efecto, variabilidad y diseño suficientes, y adoptará el mayor N como recomendación global."
-        )
-
-confirmation_ready = bool(outcome_primary.strip()) and outcome_type != "unknown"
-if dataset is not None:
-    confirmation_ready = confirmation_ready and bool(selected_outcome_column) and outcome_column_valid
-
-outcome_confirmed = st.checkbox(
-    "Confirmo que este es el outcome primario preespecificado y que su tipo, momento y vinculación con los datos son correctos.",
-    key="outcome_confirmed",
-    disabled=not confirmation_ready,
-)
-if not confirmation_ready:
-    st.error(
-        "Complete el nombre y tipo del outcome primario"
-        + (" y seleccione su columna en el dataset" if dataset is not None else "")
-        + "."
-    )
-
-outcome_metadata: dict[str, Any] = {
-    "outcome_primario": outcome_primary.strip(),
-    "definicion_outcome": outcome_definition.strip(),
-    "tipo_outcome": outcome_type,
-    "tipo_outcome_label": OUTCOME_TYPE_LABELS.get(outcome_type, outcome_type),
-    "unidad_outcome": outcome_unit.strip(),
-    "momento_evaluacion": outcome_timepoint.strip(),
-    "outcome_secundarios": outcome_secondary.strip(),
-    "columna_dataset_outcome": selected_outcome_column,
-    "confianza_columna": outcome_column_score,
-    "valor_evento": outcome_event_value if outcome_type in {"binary", "paired_binary", "diagnostic"} else "",
-    "confirmado": bool(outcome_confirmed),
-}
 
 with st.expander("⚙️ Parámetros estadísticos generales", expanded=True):
     c1, c2, c3, c4 = st.columns(4)
@@ -2748,7 +1189,6 @@ params: dict[str, Any] = {
     "power": power,
     "sided": sided,
     "loss_rate": loss_rate,
-    "outcome": outcome_metadata,
 }
 
 if design_code == "mean_estimation":
@@ -2880,93 +1320,58 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Asistente de estimación desde el outcome confirmado
-if dataset is not None and selected_outcome_column:
-    with st.expander("🧪 Estimar parámetros desde el outcome confirmado", expanded=False):
-        actual_column = next(column for column in dataset.columns if str(column) == selected_outcome_column)
-        outcome_values = dataset[actual_column].dropna()
-        st.dataframe(dataset[[actual_column]].head(100), use_container_width=True, height=260)
-
-        if outcome_type == "continuous":
-            clean = pd.to_numeric(outcome_values, errors="coerce").dropna()
-            if len(clean) > 1:
-                estimated_sd = float(clean.std(ddof=1))
-                st.write(
-                    {
-                        "n": int(clean.size),
-                        "media": round(float(clean.mean()), 4),
-                        "DE": round(estimated_sd, 4),
-                        "mínimo": round(float(clean.min()), 4),
-                        "máximo": round(float(clean.max()), 4),
-                    }
-                )
-                if st.button("Usar la DE del outcome en el cálculo", key="use_outcome_sd"):
-                    st.session_state.sd = estimated_sd
-                    st.session_state.sd_diff = estimated_sd
-                    st.rerun()
-            else:
-                st.info("No hay suficientes observaciones numéricas para estimar la desviación estándar.")
-
-        elif outcome_type in {"binary", "paired_binary", "diagnostic"}:
-            if len(outcome_values):
-                estimated_p = float((outcome_values == outcome_event_value).mean())
-                st.metric("Proporción observada del evento", f"{estimated_p:.3f}")
-                if st.button("Usar como proporción/prevalencia", key="use_outcome_proportion"):
-                    bounded = min(max(estimated_p, 0.001), 0.999)
-                    st.session_state.p = bounded
-                    st.session_state.prevalence = bounded
-                    st.session_state.p_control = bounded
-                    st.rerun()
+# Asistente de estimación desde dataset
+if dataset is not None:
+    with st.expander("🧪 Estimar parámetros desde el dataset", expanded=False):
+        st.dataframe(dataset.head(100), use_container_width=True, height=260)
+        cols = numeric_columns(dataset)
+        if cols:
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                selected_col = st.selectbox("Variable numérica", cols, key="dataset_numeric_col")
+                clean = pd.to_numeric(dataset[selected_col], errors="coerce").dropna()
+                if len(clean):
+                    st.write(
+                        {
+                            "n": int(clean.size),
+                            "media": round(float(clean.mean()), 4),
+                            "DE": round(float(clean.std(ddof=1)), 4) if clean.size > 1 else None,
+                            "mínimo": round(float(clean.min()), 4),
+                            "máximo": round(float(clean.max()), 4),
+                        }
+                    )
+                    if st.button("Usar DE en el cálculo", disabled=clean.size < 2):
+                        st.session_state.sd = float(clean.std(ddof=1))
+                        st.session_state.sd_diff = float(clean.std(ddof=1))
+                        st.rerun()
+            with ac2:
+                binary_col = st.selectbox("Variable para proporción/prevalencia", dataset.columns, key="dataset_binary_col")
+                values = dataset[binary_col].dropna()
+                unique_values = list(values.unique())[:50]
+                if unique_values:
+                    positive_value = st.selectbox("Valor considerado positivo", unique_values, key="positive_value")
+                    estimated_p = float((values == positive_value).mean())
+                    st.metric("Proporción estimada", f"{estimated_p:.3f}")
+                    if st.button("Usar como proporción y prevalencia"):
+                        bounded = min(max(estimated_p, 0.001), 0.999)
+                        st.session_state.p = bounded
+                        st.session_state.prevalence = bounded
+                        st.session_state.p_control = bounded
+                        st.rerun()
         else:
-            st.info(
-                "La estimación automática desde el dataset está disponible para outcomes continuos y binarios. Para supervivencia se requieren tiempo, evento y supuestos de seguimiento."
-            )
+            st.info("El dataset no contiene columnas numéricas detectables.")
 
 # Cálculo y dashboard
-if not outcome_confirmed:
-    st.warning("El cálculo está bloqueado hasta confirmar el outcome primario.")
-    st.stop()
-if not design_compatible_with_outcome(design_code, outcome_type):
-    st.error("El tipo de outcome confirmado no es compatible con el diseño estadístico seleccionado.")
-    st.stop()
-if dataset is not None and outcome_column_score < 0.45:
-    st.warning(
-        "La correspondencia automática entre el outcome y la columna seleccionada es baja. El cálculo continúa porque fue confirmada manualmente; documente esta decisión."
-    )
-
 try:
     result = calculate_sample_size(params)
 except Exception as exc:
     st.error(f"No se pudo completar el cálculo: {exc}")
     st.stop()
 
-coprimary_df, coprimary_warnings = calculate_structured_outcome_scenarios(
-    st.session_state.get("protocol_outcomes", []),
-    params,
-)
-primary_row = pd.DataFrame(
-    [
-        {
-            "Outcome": outcome_primary,
-            "Rol": "Primario confirmado",
-            "Tipo": OUTCOME_TYPE_LABELS.get(outcome_type, outcome_type),
-            "Diseño": DESIGNS[design_code],
-            "N total": result.n_final_total,
-            "Estado": "Calculado y confirmado",
-        }
-    ]
-)
-if coprimary_df.empty:
-    coprimary_df = primary_row
-elif normalize_token(outcome_primary) not in {normalize_token(value) for value in coprimary_df["Outcome"].astype(str)}:
-    coprimary_df = pd.concat([primary_row, coprimary_df], ignore_index=True)
-numeric_outcome_sizes = pd.to_numeric(coprimary_df["N total"], errors="coerce").dropna()
-recommended_total = int(max([result.n_final_total] + numeric_outcome_sizes.astype(int).tolist()))
-
 st.subheader("Dashboard de resumen")
 metric_cols = st.columns(4)
 metric_cols[0].markdown(
-    f'<div class="metric-card"><div class="metric-label">N total recomendado global</div><div class="metric-value">{recommended_total:,}</div><div class="metric-note">Mayor requerimiento entre outcomes · incluye pérdidas</div></div>',
+    f'<div class="metric-card"><div class="metric-label">N total final</div><div class="metric-value">{result.n_final_total:,}</div><div class="metric-note">Incluye {loss_rate:.0%} de pérdidas</div></div>',
     unsafe_allow_html=True,
 )
 metric_cols[1].markdown(
@@ -2998,16 +1403,6 @@ if design_code == "diagnostic_accuracy":
     )
 for warning in result.warnings:
     st.warning(warning)
-
-if len(coprimary_df) > 1 or coprimary_warnings:
-    st.markdown("#### Outcomes primarios/coprimarios")
-    st.dataframe(coprimary_df, hide_index=True, use_container_width=True)
-    if recommended_total > result.n_final_total:
-        st.success(
-            f"La recomendación global aumenta de {result.n_final_total:,} a **{recommended_total:,}** participantes porque otro outcome primario/coprimario exige una muestra mayor."
-        )
-    for warning in coprimary_warnings:
-        st.warning(f"No se pudo calcular un escenario coprimario: {warning}")
 
 # Curva de potencia o precisión
 plot_col, detail_col = st.columns([1.55, 1.0], gap="large")
@@ -3130,14 +1525,7 @@ sensitivity_df = pd.DataFrame(sensitivity_rows)
 st.subheader("Análisis de sensibilidad")
 st.dataframe(sensitivity_df, hide_index=True, use_container_width=True)
 
-word_report = build_word_report(
-    result,
-    params,
-    sensitivity_df,
-    dataset_metadata,
-    coprimary_df=coprimary_df if len(coprimary_df) > 1 else None,
-    recommended_total=recommended_total,
-)
+word_report = build_word_report(result, params, sensitivity_df, dataset_metadata)
 consort_docx = build_consort_docx()
 consort_pdf = build_consort_pdf()
 
@@ -3169,7 +1557,7 @@ with d3:
     )
 
 with st.expander("Texto CONSORT generado", expanded=False):
-    st.write(consort_paragraph(result, params, recommended_total))
+    st.write(consort_paragraph(result, params))
 
 st.divider()
 st.caption(
