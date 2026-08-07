@@ -1,0 +1,6 @@
+tipo_diseno: medias_independientes
+error_alfa: 0.05
+poder_estadistico: 0.80
+efecto_esperado: 5.0
+variabilidad_estimada: 10.0
+perdidas_esperadas: 0.10
